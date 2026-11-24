@@ -33,6 +33,7 @@ Measured end to end (average of 2 runs; YouTube times include streaming the vide
 curl -fsSL https://raw.githubusercontent.com/jcxk/vid2slides/main/install.sh | bash
 ```
 Installs to `~/.local/bin` (change with `PREFIX=…`) and lists any missing tools with the command to install them.
+Pin a release with `… | VID2SLIDES_REF=v0.1.0 bash`, or download `vid2slides` from [Releases](https://github.com/jcxk/vid2slides/releases). Changes: [CHANGELOG](CHANGELOG.md).
 Needs `yt-dlp jq ffmpeg tesseract poppler`, plus `yap` for local transcripts. Check any time with `vid2slides --check`.
 
 > ⚠️ **macOS only for local transcripts:** they use [`yap`](https://github.com/finnvoor/yap) (`brew install yap`, macOS 26+).

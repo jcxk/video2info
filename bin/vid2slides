@@ -3,6 +3,7 @@
 # Pipeline: yt-dlp (+jq) or a local file → ffmpeg (frames, SSIM slide changes) → tesseract (OCR PDF)
 #           → awk dedup → pdfunite.  Local transcripts: yap (on-device macOS speech recognition).
 set -euo pipefail
+VERSION=0.1.0
 
 usage() {
   cat <<EOF
@@ -23,6 +24,7 @@ Usage: vid2slides URL [options]              a YouTube video or playlist (or any
   --transcript-only        only the transcript
   --no-transcript          skip the transcript
   --check                  show which required tools are installed
+  --version                print the version
 EOF
 }
 
@@ -205,6 +207,7 @@ while (($#)); do
     --no-transcript)   DO_TRANSCRIPT=0 ;;
     -h|--help)         usage; exit 0 ;;
     --check)           CHECK=1 ;;
+    -V|--version)      echo "vid2slides $VERSION"; exit 0 ;;
     -*)                usage >&2; die "unknown option: $1" ;;
     *)                 INPUTS+=("$1") ;;
   esac
