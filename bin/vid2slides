@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# videoToSlides — turn YouTube talks/playlists or local videos into searchable slide PDFs + transcripts.
+# vid2slides — turn YouTube talks/playlists or local videos into searchable slide PDFs + transcripts.
 # Pipeline: yt-dlp (+jq) or a local file → ffmpeg (frames, SSIM slide changes) → tesseract (OCR PDF)
 #           → awk dedup → pdfunite.  Local transcripts: yap (on-device macOS speech recognition).
 set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: videoToSlides URL [options]              a YouTube video or playlist (or any yt-dlp site)
-       videoToSlides VIDEO_FILE... [options]    local videos, transcribed on-device with yap
+Usage: vid2slides URL [options]              a YouTube video or playlist (or any yt-dlp site)
+       vid2slides VIDEO_FILE... [options]    local videos, transcribed on-device with yap
 
   Note: local video transcripts are macOS only (yap needs macOS 26+).
         On other systems use --no-transcript with local files.
@@ -26,7 +26,7 @@ Usage: videoToSlides URL [options]              a YouTube video or playlist (or 
 EOF
 }
 
-die()  { printf 'videoToSlides: %s\n' "$*" >&2; exit 1; }
+die()  { printf 'vid2slides: %s\n' "$*" >&2; exit 1; }
 log()  { printf '\033[1m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
@@ -172,7 +172,7 @@ install_hint() {
   printf '%s%s\n' "$cmd" "$pkgs"
 }
 
-# videoToSlides --check: show which tools are installed, and how to install the missing ones
+# vid2slides --check: show which tools are installed, and how to install the missing ones
 check() {
   local t missing=()
   for t in yt-dlp jq ffmpeg tesseract pdfunite curl; do
@@ -250,10 +250,10 @@ if ((LOCAL)); then ((DO_TRANSCRIPT)) && need+=(yap); else need+=(yt-dlp curl); f
 missing=() ; for t in "${need[@]}"; do command -v "$t" >/dev/null || missing+=("$t"); done
 ((${#missing[@]} == 0)) || die "missing: ${missing[*]}
 install with:  $(install_hint "${missing[@]}")
-(run 'videoToSlides --check' for the full list)"
+(run 'vid2slides --check' for the full list)"
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/videoToSlides.XXXXXX")
-trap '[[ -n ${VIDEOTOSLIDES_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/vid2slides.XXXXXX")
+trap '[[ -n ${VID2SLIDES_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
 DIR=${DIR:-outputs/$(date +%Y-%m-%d_%H-%M-%S)}
 mkdir -p "$DIR"
 
@@ -358,7 +358,7 @@ while IFS=$'\t' read -r -u 3 order src title; do
   if ((DO_SLIDES)) && slides "$vt" "$DIR/$name.pdf" "$file"; then
     pdfs+=("$DIR/$name.pdf")
   fi
-  [[ -n ${VIDEOTOSLIDES_KEEP:-} ]] || rm -rf "$vt"
+  [[ -n ${VID2SLIDES_KEEP:-} ]] || rm -rf "$vt"
 done 3<"$tmp/entries.tsv"
 
 if ((${#pdfs[@]} == 1)); then cp "${pdfs[0]}" "$DIR/$OUT"

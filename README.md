@@ -1,4 +1,4 @@
-# videoToSlides
+# vid2slides
 
 YouTube talks, playlists or local videos → searchable slide PDFs + timestamped transcripts. One bash script.
 
@@ -30,10 +30,10 @@ Measured end to end (average of 2 runs; YouTube times include streaming the vide
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jcxk/videoToSlides/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jcxk/vid2slides/main/install.sh | bash
 ```
 Installs to `~/.local/bin` (change with `PREFIX=…`) and lists any missing tools with the command to install them.
-Needs `yt-dlp jq ffmpeg tesseract poppler`, plus `yap` for local transcripts. Check any time with `videoToSlides --check`.
+Needs `yt-dlp jq ffmpeg tesseract poppler`, plus `yap` for local transcripts. Check any time with `vid2slides --check`.
 
 > ⚠️ **macOS only for local transcripts:** they use [`yap`](https://github.com/finnvoor/yap) (`brew install yap`, macOS 26+).
 > Elsewhere, add `--no-transcript`. Tested on macOS only.
@@ -45,9 +45,9 @@ Needs `yt-dlp jq ffmpeg tesseract poppler`, plus `yap` for local transcripts. Ch
 ## Usage
 
 ```bash
-videoToSlides "https://youtu.be/VIDEO_ID"                    # YouTube video or playlist
-videoToSlides talk.mp4                                       # local file
-videoToSlides ~/Movies/*.mp4 --lang es-ES --ocr-lang spa     # several files → one combined deck
+vid2slides "https://youtu.be/VIDEO_ID"                    # YouTube video or playlist
+vid2slides talk.mp4                                       # local file
+vid2slides ~/Movies/*.mp4 --lang es-ES --ocr-lang spa     # several files → one combined deck
 ```
 
 | Option | Description |
