@@ -7,12 +7,12 @@ test: check             ## critical offline tests (plain `make` runs this)
 	bash tests/run.sh
 
 check:                  ## syntax check (and shellcheck, if installed)
-	bash -n bin/minVid2slides install.sh tests/run.sh
-	@if command -v shellcheck >/dev/null; then shellcheck -S warning bin/minVid2slides install.sh tests/run.sh; \
+	bash -n bin/video2info install.sh tests/run.sh
+	@if command -v shellcheck >/dev/null; then shellcheck -S warning bin/video2info install.sh tests/run.sh; \
 	else echo "(shellcheck not installed, skipped)"; fi
 
-install:                ## install this checkout's bin/minVid2slides (same steps as the curl installer)
-	@PREFIX=$(PREFIX) MINVID2SLIDES_SRC=file://$(CURDIR)/bin/minVid2slides ./install.sh
+install:                ## install this checkout's bin/video2info (same steps as the curl installer)
+	@PREFIX=$(PREFIX) VIDEO2INFO_SRC=file://$(CURDIR)/bin/video2info ./install.sh
 
 uninstall:
-	rm -f $(PREFIX)/bin/minVid2slides
+	rm -f $(PREFIX)/bin/video2info

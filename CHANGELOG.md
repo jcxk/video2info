@@ -2,11 +2,17 @@
 
 All notable changes to this project are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-24
+
+### Changed
+- Renamed `minVid2slides` to `video2info` (command, repository, `VIDEO2INFO_*` environment variables, `~/.cache/video2info`). The scope is now "video → information": notes, slides and transcripts.
+- **Default output is Markdown.** Choose outputs with `-f/--format md,pdf,txt`.
+- Per-video transcript file renamed from `NN_Title_transcript.txt` to `NN_Title.txt`. Its content is unchanged.
+- `-o NAME` is now the base name of the combined files (default `Combined`: `Combined.md` / `.pdf` / `.txt`). Combined files are only written for more than one video.
 
 ### Added
-- Offline test suite (`make`): CLI checks, end-to-end slide extraction from a generated video, and local transcript formatting with stubbed `yap` and `whisper-cli`.
-- GitHub Actions runs it on macOS and Ubuntu; README badges.
+- Markdown notes: one section per slide with its start time, image (`NN_Title_assets/slide-NN.jpg`), OCR text, and the transcript lines said while it was on screen.
+- Offline test suite (`make`) and GitHub Actions CI on macOS and Ubuntu; README badges.
 
 ## [0.2.0] - 2026-11-24
 
@@ -38,5 +44,6 @@ First release.
 - ⚠️ Local video transcripts are macOS only. On other systems, use `--no-transcript`.
 - Tested on macOS only.
 
+[0.3.0]: https://github.com/jcxk/video2info/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jcxk/minVid2slides/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jcxk/minVid2slides/releases/tag/v0.1.0

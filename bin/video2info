@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# minVid2slides — turn YouTube talks/playlists or local videos into searchable slide PDFs + transcripts.
-# Pipeline: yt-dlp (+jq) or a local file → ffmpeg (frames, SSIM slide changes) → tesseract (OCR PDF)
-#           → awk dedup → pdfunite.  Local transcripts: yap (macOS) or whisper.cpp (any OS), on-device.
+# video2info — extract the slides and transcript of a video (YouTube, playlists, local files) into
+# Markdown notes (each slide with what was said while it was shown), searchable PDF and/or plain text.
+# Pipeline: yt-dlp (+jq) or a local file → ffmpeg (frames, SSIM slide changes) → tesseract (OCR)
+#           → awk dedup → jq (md, txt) / pdfunite (pdf).  Local transcripts: yap (macOS) or whisper.cpp.
 set -euo pipefail
-VERSION=0.2.0
+VERSION=0.3.0
 
 usage() {
   cat <<EOF
-Usage: minVid2slides URL [options]              a YouTube video or playlist (or any yt-dlp site)
-       minVid2slides VIDEO_FILE... [options]    local videos, transcribed on-device
+Usage: video2info URL [options]              a YouTube video or playlist (or any yt-dlp site)
+       video2info VIDEO_FILE... [options]    local videos, transcribed on-device
 
   Local transcripts use yap on macOS 26+, else whisper.cpp (whisper-cli; its model is
-  downloaded to ~/.cache/minVid2slides on first use, or set MINVID2SLIDES_WHISPER_MODEL).
+  downloaded to ~/.cache/video2info on first use, or set VIDEO2INFO_WHISPER_MODEL).
 
-  -o NAME.pdf              combined PDF name (default: Combined_Slides.pdf)
+  -f, --format LIST        md, pdf, txt or a comma list (default: md)
+                             md:  notes, each slide (image + OCR text) with its transcript lines
+                             pdf: searchable slide PDF        txt: timestamped transcript
+  -o NAME                  base name of the combined files for several videos (default: Combined)
   -d DIR                   output folder (default: ./outputs/<timestamp>)
   --lang CODE              transcript language (default: the video's own language;
                            local files: en-US, e.g. --lang es-ES)
@@ -21,14 +25,14 @@ Usage: minVid2slides URL [options]              a YouTube video or playlist (or 
   -j N                     parallel OCR jobs (default: CPU cores)
   --ssim T                 slide-change threshold 0-1 (default: 0.9; higher = more slides)
   --crop SIDES             cut edges off every frame, e.g. right=25%,bottom=10% (a fixed webcam or player bar)
-  --transcript-only        only the transcript
-  --no-transcript          skip the transcript
+  --transcript-only        no slides
+  --no-transcript          no transcript
   --check                  show which required tools are installed
   --version                print the version
 EOF
 }
 
-die()  { printf 'minVid2slides: %s\n' "$*" >&2; exit 1; }
+die()  { printf 'video2info: %s\n' "$*" >&2; exit 1; }
 log()  { printf '\033[1m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
@@ -84,24 +88,52 @@ def find($d; $t):
 | [$key, $src, (first($fmts[]? | select(.ext == "json3" and .url) | .url) // "")] | @tsv
 JQ
 
-IFS= read -r -d '' JQ_TRANSCRIPT <<'JQ' || true
-# json3 captions  ->  transcript text (header, full text, timestamped lines).
-# --arg title, url, lang_line
+IFS= read -r -d '' JQ_EVENTS <<'JQ' || true
+# json3 captions  ->  tr.json {lang_line, events: [{t: ms, text}]}: whitespace cleaned, repeats dropped.
+# --arg lang_line
+{lang_line: $lang_line,
+ events: ([.events[]? | select(.segs)
+   | {t: (.tStartMs // 0), text: ([.segs[].utf8 // ""] | join("") | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; ""))}
+   | select(.text != "")]
+   | reduce .[] as $e ([]; if length > 0 and .[-1].text == $e.text then . else . + [$e] end))}
+JQ
+
+IFS= read -r -d '' JQ_TS <<'JQ' || true
 def pad: tostring | if length < 2 then "0" + . else . end;
 def ts: (. / 1000 | floor) as $s | ($s / 3600 | floor) as $h | (($s % 3600) / 60 | floor) as $m
   | if $h > 0 then "\($h | pad):\($m | pad):\($s % 60 | pad)" else "\($m | pad):\($s % 60 | pad)" end;
+JQ
 
-[.events[]? | select(.segs)
- | {t: (.tStartMs // 0), text: ([.segs[].utf8 // ""] | join("") | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; ""))}
- | select(.text != "")]
-| reduce .[] as $e ([]; if length > 0 and .[-1].text == $e.text then . else . + [$e] end)
-| "Title: \($title)\nURL: \($url)\nLanguage: \($lang_line)\n\("=" * 80)\n\n### FULL TEXT ###\n\n"
-  + (map(.text) | join(" ")) + "\n\n### TIMESTAMPED TRANSCRIPT ###\n\n"
-  + (map("[\(.t | ts)] \(.text)") | join("\n"))
+IFS= read -r -d '' JQ_TXT <<'JQ' || true
+# tr.json  ->  transcript text (header, full text, timestamped lines).   --arg title, url
+"Title: \($title)\nURL: \($url)\nLanguage: \(.lang_line)\n\("=" * 80)\n\n### FULL TEXT ###\n\n"
++ (.events | map(.text) | join(" ")) + "\n\n### TIMESTAMPED TRANSCRIPT ###\n\n"
++ (.events | map("[\(.t | ts)] \(.text)") | join("\n"))
+JQ
+
+IFS= read -r -d '' JQ_MD <<'JQ' || true
+# Markdown notes.  --arg title, url   --slurpfile tr tr.json   --slurpfile sl slides.json ([{t, img, text}])
+# Each slide: heading with its time, image, OCR text as a quote, then the transcript lines said while it was shown.
+def lines: map("- [\(.t | ts)] \(.text)") | join("\n");
+def quote: split("\n") | map(gsub("[\f\\s]+$"; "") | select(test("\\S"))) | map("> " + .) | join("  \n");
+($tr[0].events // []) as $ev | ($sl[0] // []) as $s | ($tr[0].lang_line // "") as $lang
+| "# \($title)\n\nSource: \($url)" + (if $lang != "" then "  \nTranscript: \($lang)" else "" end) + "\n"
++ if ($s | length) == 0 then
+    (if ($ev | length) > 0 then "\n## Transcript\n\n" + ($ev | lines) + "\n" else "" end)
+  else
+    ([$ev[] | select(.t < $s[0].t)] as $intro
+     | if ($intro | length) > 0 then "\n## [00:00] Intro\n\n" + ($intro | lines) + "\n" else "" end)
+    + ([range($s | length) as $i | $s[$i] as $x | ($s[$i + 1].t // infinite) as $end
+        | [$ev[] | select(.t >= $x.t and .t < $end)] as $said
+        | "\n## [\($x.t | ts)] Slide \($i + 1)\n\n![slide \($i + 1)](\($x.img))\n"
+          + (($x.text | quote) as $q | if $q != "" then "\n" + $q + "\n" else "" end)
+          + (if ($said | length) > 0 then "\n" + ($said | lines) + "\n" else "" end)] | join(""))
+  end
 JQ
 
 IFS= read -r -d '' AWK_TEXTDEDUP <<'AWK' || true
-# tesseract .tsv files (in slide order) -> .pdf paths to keep.   usage: awk -F'\t' -v t=0.6 -f textdedup.awk *.tsv
+# tesseract .tsv files (in slide order) -> "base<TAB>start_frame" per kept slide (base = path without .tsv).
+# A slide starts at the frame after the previous candidate; a build that replaces it keeps that start.
 # Words = confident (>= 60%) tokens of 3+ chars. Footer words on > 35% of pages are ignored when comparing.
 # Each page is compared with the previous kept page:
 #   same slide                  -> keep the page with more words
@@ -124,6 +156,7 @@ function revisit(p, c,   a, k, j, dp, dc, ip) {
   k = split(words[c], a, " "); for (j = 1; j <= k; j++) if (df[a[j]] <= maxdf) dc++
   return dp >= 3 && dc >= 3 && ip / (dp + dc - ip) >= 0.8
 }
+function frame(i,   b) { b = f[i]; sub(/.*\//, "", b); sub(/\.tsv$/, "", b); return b + 0 }
 function rel(p, c,   a, k, j, dp, dc, ip, ai) {
   dp = dc = ip = ai = 0
   k = split(words[p], a, " ")
@@ -148,9 +181,9 @@ END {
     if (cnt[i] < 3) continue
     r = kept ? rel(out[kept], i) : ""
     if (r == "") for (j = 1; j < kept; j++) if (revisit(out[j], i)) { r = "drop"; break }
-    if (r == "replace") out[kept] = i; else if (r == "") out[++kept] = i
+    if (r == "replace") out[kept] = i; else if (r == "") { out[++kept] = i; st[kept] = i > 1 ? frame(i - 1) + 1 : 1 }
   }
-  for (i = 1; i <= kept; i++) { p = f[out[i]]; sub(/\.tsv$/, ".pdf", p); print p }
+  for (i = 1; i <= kept; i++) { p = f[out[i]]; sub(/\.tsv$/, "", p); print p "\t" st[i] }
 }
 AWK
 
@@ -179,9 +212,9 @@ install_hint() {
   return 0
 }
 
-# stt_engine: the on-device speech-to-text tool for local videos (MINVID2SLIDES_STT=yap|whisper to force one)
+# stt_engine: the on-device speech-to-text tool for local videos (VIDEO2INFO_STT=yap|whisper to force one)
 stt_engine() {
-  case ${MINVID2SLIDES_STT:-} in
+  case ${VIDEO2INFO_STT:-} in
     yap)     command -v yap >/dev/null && echo yap ;;
     whisper) command -v whisper-cli >/dev/null && echo whisper-cli ;;
     *) if [[ $(uname -s) == Darwin ]] && command -v yap >/dev/null; then echo yap
@@ -194,7 +227,7 @@ stt_hint() {
   else install_hint whisper-cli | tr -s '\n' ' '; fi
 }
 
-# minVid2slides --check: show which tools are installed, and how to install the missing ones
+# video2info --check: show which tools are installed, and how to install the missing ones
 check() {
   local t missing=()
   for t in yt-dlp jq ffmpeg tesseract pdfunite curl; do
@@ -211,12 +244,13 @@ check() {
 }
 
 # ---------------------------------------------------------------- arguments
-INPUTS=() OUT=Combined_Slides.pdf DIR="" CROP="" SUB_LANG="" OCR_LANG=eng SSIM=0.9 TEXT_SIM=0.6
+INPUTS=() OUT=Combined FORMATS=md DIR="" CROP="" SUB_LANG="" OCR_LANG=eng SSIM=0.9 TEXT_SIM=0.6
 JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 DO_TRANSCRIPT=1 DO_SLIDES=1 CHECK=0
 while (($#)); do
   case $1 in
-    -o|--output)       OUT=${2:?}; shift ;;
+    -o|--output)       OUT=${2:?}; OUT=${OUT%.*}; shift ;;
+    -f|--format)       FORMATS=${2:?}; shift ;;
     -d|--output-dir)   DIR=${2:?}; shift ;;
     --crop)            CROP=${2:?}; shift ;;
     -l|--lang)         SUB_LANG=${2:?}; shift ;;
@@ -227,7 +261,7 @@ while (($#)); do
     --no-transcript)   DO_TRANSCRIPT=0 ;;
     -h|--help)         usage; exit 0 ;;
     --check)           CHECK=1 ;;
-    -V|--version)      echo "minVid2slides $VERSION"; exit 0 ;;
+    -V|--version)      echo "video2info $VERSION"; exit 0 ;;
     -*)                usage >&2; die "unknown option: $1" ;;
     *)                 INPUTS+=("$1") ;;
   esac
@@ -246,7 +280,13 @@ if [[ -n $CROP ]]; then
   ((l + r < 90 && t + b < 90)) || die "--crop: that leaves almost nothing"
   CROPF="crop=iw*$((100 - l - r))/100:ih*$((100 - t - b))/100:iw*$l/100:ih*$t/100,"
 fi
-((DO_SLIDES || DO_TRANSCRIPT)) || die "--transcript-only and --no-transcript leave nothing to do"
+WANT_MD=0 WANT_PDF=0 WANT_TXT=0
+for fmt in ${FORMATS//,/ }; do
+  case $fmt in md) WANT_MD=1 ;; pdf) WANT_PDF=1 ;; txt) WANT_TXT=1 ;; *) die "--format: unknown format '$fmt' (md, pdf, txt)" ;; esac
+done
+((WANT_MD || WANT_PDF)) || DO_SLIDES=0          # txt only: no slides needed
+((WANT_MD || WANT_TXT)) || DO_TRANSCRIPT=0      # pdf only: no transcript needed
+((DO_SLIDES || DO_TRANSCRIPT)) || die "nothing to do: check --format, --transcript-only and --no-transcript"
 
 if ((CHECK)); then check; exit $?; fi
 ((${#INPUTS[@]})) || { usage >&2; exit 1; }
@@ -271,19 +311,20 @@ fi
 
 need=(jq)
 if ((LOCAL)); then [[ $(stt_engine) == whisper-cli ]] && ((DO_TRANSCRIPT)) && need+=(ffmpeg curl); else need+=(yt-dlp curl); fi
-((DO_SLIDES)) && need+=(ffmpeg tesseract pdfunite)
+((DO_SLIDES)) && need+=(ffmpeg tesseract)
+((DO_SLIDES && WANT_PDF)) && need+=(pdfunite)
 missing=() ; for t in "${need[@]}"; do command -v "$t" >/dev/null || missing+=("$t"); done
 ((${#missing[@]} == 0)) || die "missing: ${missing[*]}
 install with:  $(install_hint "${missing[@]}")
-(run 'minVid2slides --check' for the full list)"
+(run 'video2info --check' for the full list)"
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/minVid2slides.XXXXXX")
-trap '[[ -n ${MINVID2SLIDES_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/video2info.XXXXXX")
+trap '[[ -n ${VIDEO2INFO_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
 DIR=${DIR:-outputs/$(date +%Y-%m-%d_%H-%M-%S)}
 mkdir -p "$DIR"
 
 # ---------------------------------------------------------------- steps
-# transcript INFO_JSON OUT_TXT
+# transcript INFO_JSON OUT_JSON — YouTube captions → tr.json
 transcript() {
   local info=$1 out=$2 sel key src url sub=${1%/*}/sub.json3
   sel=$(jq -r --arg lang "$SUB_LANG" "$JQ_CAPTIONS" "$info" 2>&1) \
@@ -294,16 +335,15 @@ transcript() {
       --sub-langs "$key" --sub-format json3 -o "${sub%.json3}" || return 1
     mv "${sub%.json3}".*json3 "$sub" 2>/dev/null || { warn "transcript: download failed ($key)"; return 1; }
   fi
-  jq -r --arg title "$(jq -r .title "$info")" --arg url "$(jq -r '.webpage_url // ""' "$info")" \
-    --arg lang_line "$key (source: $src, video default: $(jq -r '.language // "unknown"' "$info"))" \
-    "$JQ_TRANSCRIPT" "$sub" >"$out"
-  log "transcript: $(grep -c '^\[' "$out") lines ($key, $src) → $out"
+  jq --arg lang_line "$key (source: $src, video default: $(jq -r '.language // "unknown"' "$info"))" \
+    "$JQ_EVENTS" "$sub" >"$out"
+  log "transcript: $(jq '.events | length' "$out") lines ($key, $src)"
 }
 
 # whisper_model LANG — path of the whisper.cpp model (English-only model for en, else multilingual)
 whisper_model() {
-  [[ -n ${MINVID2SLIDES_WHISPER_MODEL:-} ]] && { echo "$MINVID2SLIDES_WHISPER_MODEL"; return; }
-  local name=ggml-base.bin dir=${XDG_CACHE_HOME:-$HOME/.cache}/minVid2slides
+  [[ -n ${VIDEO2INFO_WHISPER_MODEL:-} ]] && { echo "$VIDEO2INFO_WHISPER_MODEL"; return; }
+  local name=ggml-base.bin dir=${XDG_CACHE_HOME:-$HOME/.cache}/video2info
   [[ $1 == en ]] && name=ggml-base.en.bin
   if [[ ! -s $dir/$name ]]; then
     log "downloading whisper model $name (once, ~150 MB) → $dir"
@@ -316,7 +356,7 @@ whisper_model() {
   echo "$dir/$name"
 }
 
-# local_transcript VIDEO_FILE WORK_DIR OUT_TXT — on-device speech recognition, same text format as YouTube
+# local_transcript VIDEO_FILE WORK_DIR OUT_JSON — on-device speech recognition → tr.json (same shape as YouTube)
 local_transcript() {
   local file=$1 work=$2 out=$3 loc=${SUB_LANG:-en-US} engine events lang_line
   [[ $loc == default || $loc == auto ]] && loc=en-US
@@ -337,14 +377,14 @@ local_transcript() {
     events=$(jq '{events: [.transcription[]? | {tStartMs: .offsets.from, segs: [{utf8: .text}]}]}' "$work/whisper.json")
     lang_line="$lang (source: on-device speech recognition, whisper.cpp ${model##*/})"
   fi
-  jq -r --arg title "${file##*/}" --arg url "$file" --arg lang_line "$lang_line" "$JQ_TRANSCRIPT" <<<"$events" >"$out"
-  log "transcript: $(grep -c '^\[' "$out") lines → $out"
+  jq --arg lang_line "$lang_line" "$JQ_EVENTS" <<<"$events" >"$out"
+  log "transcript: $(jq '.events | length' "$out") lines"
 }
 
-# slides WORK_DIR OUT_PDF [VIDEO_FILE] — writes OUT_PDF if any slide survives.
+# slides WORK_DIR [VIDEO_FILE] — writes WORK_DIR/slides.tsv ("base<TAB>start_ms" per slide; base.jpg/.txt/.pdf).
 # Without VIDEO_FILE the video is streamed with yt-dlp from WORK_DIR/info.json.
 slides() {
-  local work=$1 out=$2 file=${3:-} frames=$1/frames keep=$1/keep
+  local work=$1 file=${2:-} frames=$1/frames keep=$1/keep
   local vf="fps=0.5,${CROPF}scale='min(1280,iw)':-2"
   mkdir -p "$frames" "$keep"
 
@@ -368,19 +408,42 @@ slides() {
     | while read -r i; do f=$(printf %05d.jpg "$i"); ln "$frames/$f" "$keep/$f"; done
   log "$n frames → $(find "$keep" -name '*.jpg' | wc -l | tr -d ' ') slide candidates"
 
-  # 3. OCR in parallel: one tesseract run → searchable PDF + text per slide
+  # 3. OCR in parallel: one tesseract run per slide → text + word confidences (+ searchable PDF page)
+  local configs="txt tsv"; ((WANT_PDF)) && configs="pdf txt tsv"
   find "$keep" -name '*.jpg' -print0 \
     | OMP_THREAD_LIMIT=1 xargs -0 -P "$JOBS" -I{} sh -c \
-        'tesseract "$1" "${1%.jpg}" -l "$2" --psm 3 pdf tsv >/dev/null 2>&1' _ {} "$OCR_LANG"
+        'tesseract "$1" "${1%.jpg}" -l "$2" --psm 3 $3 >/dev/null 2>&1' _ {} "$OCR_LANG" "$configs"
 
   # 4. drop text-less frames, merge neighbours with the same words (keep the fuller one), drop revisits
-  local pages=() p
-  while read -r p; do pages+=("$p"); done < <(LC_ALL=C awk -F'\t' -v t="$TEXT_SIM" "$AWK_TEXTDEDUP" "$keep"/*.tsv)
-  ((${#pages[@]} > 0)) || { warn "no slides with text found"; return 1; }
+  LC_ALL=C awk -F'\t' -v t="$TEXT_SIM" "$AWK_TEXTDEDUP" "$keep"/*.tsv \
+    | LC_ALL=C awk -F'\t' '{print $1 "\t" ($2 - 1) * 2000}' >"$work/slides.tsv"
+  [[ -s $work/slides.tsv ]] || { warn "no slides with text found"; return 1; }
+  log "slides: $(wc -l <"$work/slides.tsv" | tr -d ' ')"
+}
 
-  # 5. merge
-  if ((${#pages[@]} == 1)); then cp "${pages[0]}" "$out"; else pdfunite "${pages[@]}" "$out" || return 1; fi
-  log "slides: ${#pages[@]} pages → $out"
+# write_pdf WORK_DIR OUT_PDF — join the searchable pages of the kept slides
+write_pdf() {
+  local pages=() b t
+  while IFS=$'\t' read -r b t; do pages+=("$b.pdf"); done <"$1/slides.tsv"
+  if ((${#pages[@]} == 1)); then cp "${pages[0]}" "$2"; else pdfunite "${pages[@]}" "$2"; fi && log "pdf: ${#pages[@]} pages → $2"
+}
+
+# write_md WORK_DIR NAME — NAME.md with NAME_assets/slide-NN.jpg (slides optional, transcript optional)
+write_md() {
+  local work=$1 name=$2 b t i=0 img
+  : >"$work/slides.jsonl"
+  if [[ -s $work/slides.tsv ]]; then
+    mkdir -p "$DIR/${name}_assets"
+    while IFS=$'\t' read -r b t; do
+      i=$((i + 1)); img=$(printf '%s_assets/slide-%02d.jpg' "$name" "$i")
+      cp "$b.jpg" "$DIR/$img"
+      jq -n --argjson t "$t" --arg img "$img" --rawfile text "$b.txt" '{t: $t, img: $img, text: $text}' >>"$work/slides.jsonl"
+    done <"$work/slides.tsv"
+  fi
+  jq -s . "$work/slides.jsonl" >"$work/slides.json"
+  jq -nr --arg title "$(jq -r .title "$work/meta.json")" --arg url "$(jq -r .url "$work/meta.json")" \
+    --slurpfile tr "$work/tr.json" --slurpfile sl "$work/slides.json" "$JQ_TS $JQ_MD" >"$DIR/$name.md"
+  log "md: $i slides → $DIR/$name.md"
 }
 
 # ---------------------------------------------------------------- main
@@ -393,34 +456,47 @@ else
   jq -r "$JQ_ENTRIES" "$tmp/probe.json" >"$tmp/entries.tsv"
 fi
 
-pdfs=() transcripts=()
+mds=() pdfs=() txts=()
 while IFS=$'\t' read -r -u 3 order src title; do
   name=$(printf '%02d_%s' "$order" "$title")
   vt=$tmp/$order && mkdir -p "$vt"
   log "[$order] $title"
   file=""
-  if ((LOCAL)); then file=$src
-  elif [[ $single == true ]]; then cp "$tmp/probe.json" "$vt/info.json"
-  else yt-dlp -q --no-warnings -J --skip-download "$src" >"$vt/info.json" || { warn "metadata failed: $src"; continue; }
+  if ((LOCAL)); then
+    file=$src
+    base=${file##*/}
+    jq -n --arg title "${base%.*}" --arg txt_title "$base" --arg url "$file" '{$title, $txt_title, $url}' >"$vt/meta.json"
+  else
+    if [[ $single == true ]]; then cp "$tmp/probe.json" "$vt/info.json"
+    else yt-dlp -q --no-warnings -J --skip-download "$src" >"$vt/info.json" || { warn "metadata failed: $src"; continue; }
+    fi
+    jq '{title: (.title // ""), url: (.webpage_url // "")}' "$vt/info.json" >"$vt/meta.json"
   fi
+  echo '{"lang_line": "", "events": []}' >"$vt/tr.json"
+  have_tr=0
   if ((DO_TRANSCRIPT)); then
-    if [[ -n $file ]]; then local_transcript "$file" "$vt" "$DIR/${name}_transcript.txt"
-    else transcript "$vt/info.json" "$DIR/${name}_transcript.txt"; fi && transcripts+=("$DIR/${name}_transcript.txt")
+    if [[ -n $file ]]; then local_transcript "$file" "$vt" "$vt/tr.json"
+    else transcript "$vt/info.json" "$vt/tr.json"; fi && have_tr=1
   fi
-  if ((DO_SLIDES)) && slides "$vt" "$DIR/$name.pdf" "$file"; then
-    pdfs+=("$DIR/$name.pdf")
+  have_slides=0
+  ((DO_SLIDES)) && slides "$vt" "$file" && have_slides=1
+
+  if ((WANT_TXT && have_tr)); then
+    jq -r --arg title "$(jq -r '.txt_title // .title' "$vt/meta.json")" --arg url "$(jq -r .url "$vt/meta.json")" \
+      "$JQ_TS $JQ_TXT" "$vt/tr.json" >"$DIR/$name.txt" && txts+=("$DIR/$name.txt") && log "txt: → $DIR/$name.txt"
   fi
-  [[ -n ${MINVID2SLIDES_KEEP:-} ]] || rm -rf "$vt"
+  if ((WANT_PDF && have_slides)) && write_pdf "$vt" "$DIR/$name.pdf"; then pdfs+=("$DIR/$name.pdf"); fi
+  if ((WANT_MD && (have_slides || have_tr))) && write_md "$vt" "$name"; then mds+=("$DIR/$name.md"); fi
+  [[ -n ${VIDEO2INFO_KEEP:-} ]] || rm -rf "$vt"
 done 3<"$tmp/entries.tsv"
 
-if ((${#pdfs[@]} == 1)); then cp "${pdfs[0]}" "$DIR/$OUT"
-elif ((${#pdfs[@]} > 1)); then pdfunite "${pdfs[@]}" "$DIR/$OUT"
+# several videos → one combined file per format
+if ((${#mds[@]} > 1)); then
+  for f in "${mds[@]}"; do cat "$f"; printf '\n---\n\n'; done >"$DIR/$OUT.md" && log "combined: $DIR/$OUT.md"
 fi
-if ((${#pdfs[@]})); then log "combined: $DIR/$OUT"; fi
-
-if ((${#transcripts[@]} > 1)); then
-  for t in "${transcripts[@]}"; do cat "$t"; printf '\n\n%s\n\n' "$(printf '#%.0s' {1..80})"; done \
-    >"$DIR/Combined_Transcripts.txt"
-  log "combined transcripts: $DIR/Combined_Transcripts.txt"
+if ((${#pdfs[@]} > 1)); then pdfunite "${pdfs[@]}" "$DIR/$OUT.pdf" && log "combined: $DIR/$OUT.pdf"; fi
+if ((${#txts[@]} > 1)); then
+  for f in "${txts[@]}"; do cat "$f"; printf '\n\n%s\n\n' "$(printf '#%.0s' {1..80})"; done >"$DIR/$OUT.txt"
+  log "combined: $DIR/$OUT.txt"
 fi
 log "done → $DIR/"
