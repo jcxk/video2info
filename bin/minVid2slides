@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# vid2slides — turn YouTube talks/playlists or local videos into searchable slide PDFs + transcripts.
+# minVid2slides — turn YouTube talks/playlists or local videos into searchable slide PDFs + transcripts.
 # Pipeline: yt-dlp (+jq) or a local file → ffmpeg (frames, SSIM slide changes) → tesseract (OCR PDF)
-#           → awk dedup → pdfunite.  Local transcripts: yap (on-device macOS speech recognition).
+#           → awk dedup → pdfunite.  Local transcripts: yap (macOS) or whisper.cpp (any OS), on-device.
 set -euo pipefail
-VERSION=0.1.0
+VERSION=0.2.0
 
 usage() {
   cat <<EOF
-Usage: vid2slides URL [options]              a YouTube video or playlist (or any yt-dlp site)
-       vid2slides VIDEO_FILE... [options]    local videos, transcribed on-device with yap
+Usage: minVid2slides URL [options]              a YouTube video or playlist (or any yt-dlp site)
+       minVid2slides VIDEO_FILE... [options]    local videos, transcribed on-device
 
-  Note: local video transcripts are macOS only (yap needs macOS 26+).
-        On other systems use --no-transcript with local files.
+  Local transcripts use yap on macOS 26+, else whisper.cpp (whisper-cli; its model is
+  downloaded to ~/.cache/minVid2slides on first use, or set MINVID2SLIDES_WHISPER_MODEL).
 
   -o NAME.pdf              combined PDF name (default: Combined_Slides.pdf)
   -d DIR                   output folder (default: ./outputs/<timestamp>)
@@ -28,7 +28,7 @@ Usage: vid2slides URL [options]              a YouTube video or playlist (or any
 EOF
 }
 
-die()  { printf 'vid2slides: %s\n' "$*" >&2; exit 1; }
+die()  { printf 'minVid2slides: %s\n' "$*" >&2; exit 1; }
 log()  { printf '\033[1m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
@@ -156,7 +156,7 @@ AWK
 
 # install_hint TOOL... — one ready-to-run command for this machine's package manager
 install_hint() {
-  local pm cmd t p pkgs=""
+  local pm cmd t p pkgs="" extra=""
   if   command -v brew    >/dev/null; then pm=brew;   cmd="brew install"
   elif command -v apt-get >/dev/null; then pm=apt;    cmd="sudo apt install -y"
   elif command -v dnf     >/dev/null; then pm=dnf;    cmd="sudo dnf install -y"
@@ -167,22 +167,42 @@ install_hint() {
       brew:pdfunite|pacman:pdfunite) p=poppler ;;
       apt:pdfunite|dnf:pdfunite)     p=poppler-utils ;;
       apt:tesseract)                 p=tesseract-ocr ;;
+      brew:whisper-cli)              p=whisper-cpp ;;
+      apt:whisper-cli)               p=whisper.cpp ;;
+      *:whisper-cli)                 p=""; extra="  whisper-cli: see https://github.com/ggml-org/whisper.cpp" ;;
       *)                             p=$t ;;
     esac
-    pkgs="$pkgs $p"
+    [[ -n $p ]] && pkgs="$pkgs $p"
   done
-  printf '%s%s\n' "$cmd" "$pkgs"
+  [[ -n $pkgs ]] && printf '%s%s\n' "$cmd" "$pkgs"
+  [[ -n $extra ]] && printf '%s\n' "$extra"
+  return 0
 }
 
-# vid2slides --check: show which tools are installed, and how to install the missing ones
+# stt_engine: the on-device speech-to-text tool for local videos (MINVID2SLIDES_STT=yap|whisper to force one)
+stt_engine() {
+  case ${MINVID2SLIDES_STT:-} in
+    yap)     command -v yap >/dev/null && echo yap ;;
+    whisper) command -v whisper-cli >/dev/null && echo whisper-cli ;;
+    *) if [[ $(uname -s) == Darwin ]] && command -v yap >/dev/null; then echo yap
+       elif command -v whisper-cli >/dev/null; then echo whisper-cli; fi ;;
+  esac
+  return 0
+}
+stt_hint() {
+  if [[ $(uname -s) == Darwin ]]; then echo "brew install yap  (macOS 26+; or: brew install whisper-cpp)"
+  else install_hint whisper-cli | tr -s '\n' ' '; fi
+}
+
+# minVid2slides --check: show which tools are installed, and how to install the missing ones
 check() {
   local t missing=()
   for t in yt-dlp jq ffmpeg tesseract pdfunite curl; do
     if command -v "$t" >/dev/null; then printf '  \033[32m✓\033[0m %s\n' "$t"
     else printf '  \033[31m✗\033[0m %s\n' "$t"; missing+=("$t"); fi
   done
-  if command -v yap >/dev/null; then printf '  \033[32m✓\033[0m yap (local video transcripts)\n'
-  else printf '  \033[33m-\033[0m yap (optional: local video transcripts, macOS 26+: brew install yap)\n'; fi
+  if [[ -n $(stt_engine) ]]; then printf '  \033[32m✓\033[0m %s (local video transcripts)\n' "$(stt_engine)"
+  else printf '  \033[33m-\033[0m local video transcripts (optional): %s\n' "$(stt_hint)"; fi
   command -v tesseract >/dev/null && printf 'OCR languages: %s installed (more: tesseract --list-langs)\n' \
     "$(tesseract --list-langs 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
   ((${#missing[@]} == 0)) && return 0
@@ -207,7 +227,7 @@ while (($#)); do
     --no-transcript)   DO_TRANSCRIPT=0 ;;
     -h|--help)         usage; exit 0 ;;
     --check)           CHECK=1 ;;
-    -V|--version)      echo "vid2slides $VERSION"; exit 0 ;;
+    -V|--version)      echo "minVid2slides $VERSION"; exit 0 ;;
     -*)                usage >&2; die "unknown option: $1" ;;
     *)                 INPUTS+=("$1") ;;
   esac
@@ -239,8 +259,10 @@ for i in "${!INPUTS[@]}"; do
 done
 if [[ -f ${INPUTS[0]} ]]; then
   LOCAL=1
-  ((DO_TRANSCRIPT)) && [[ $(uname -s) != Darwin ]] \
-    && die "local video transcripts are macOS only (yap, macOS 26+); add --no-transcript for slides only"
+  ((DO_TRANSCRIPT)) && [[ -z $(stt_engine) ]] \
+    && die "local video transcripts need yap (macOS) or whisper-cli (whisper.cpp)
+install with:  $(stt_hint)
+(or add --no-transcript for slides only)"
   for f in "${INPUTS[@]}"; do [[ -f $f ]] || die "no such file: $f"; done
 else
   [[ ${INPUTS[0]} == *://* ]] || die "no such file: ${INPUTS[0]} (URLs start with https://)"
@@ -248,15 +270,15 @@ else
 fi
 
 need=(jq)
-if ((LOCAL)); then ((DO_TRANSCRIPT)) && need+=(yap); else need+=(yt-dlp curl); fi
+if ((LOCAL)); then [[ $(stt_engine) == whisper-cli ]] && ((DO_TRANSCRIPT)) && need+=(ffmpeg curl); else need+=(yt-dlp curl); fi
 ((DO_SLIDES)) && need+=(ffmpeg tesseract pdfunite)
 missing=() ; for t in "${need[@]}"; do command -v "$t" >/dev/null || missing+=("$t"); done
 ((${#missing[@]} == 0)) || die "missing: ${missing[*]}
 install with:  $(install_hint "${missing[@]}")
-(run 'vid2slides --check' for the full list)"
+(run 'minVid2slides --check' for the full list)"
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/vid2slides.XXXXXX")
-trap '[[ -n ${VID2SLIDES_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/minVid2slides.XXXXXX")
+trap '[[ -n ${MINVID2SLIDES_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
 DIR=${DIR:-outputs/$(date +%Y-%m-%d_%H-%M-%S)}
 mkdir -p "$DIR"
 
@@ -278,17 +300,44 @@ transcript() {
   log "transcript: $(grep -c '^\[' "$out") lines ($key, $src) → $out"
 }
 
-# local_transcript VIDEO_FILE WORK_DIR OUT_TXT — on-device speech recognition (yap), same text format
+# whisper_model LANG — path of the whisper.cpp model (English-only model for en, else multilingual)
+whisper_model() {
+  [[ -n ${MINVID2SLIDES_WHISPER_MODEL:-} ]] && { echo "$MINVID2SLIDES_WHISPER_MODEL"; return; }
+  local name=ggml-base.bin dir=${XDG_CACHE_HOME:-$HOME/.cache}/minVid2slides
+  [[ $1 == en ]] && name=ggml-base.en.bin
+  if [[ ! -s $dir/$name ]]; then
+    log "downloading whisper model $name (once, ~150 MB) → $dir"
+    mkdir -p "$dir"
+    local bar=-sS; [[ -t 2 ]] && bar=--progress-bar
+    curl -fL "$bar" -o "$dir/$name.part" \
+      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$name" && mv "$dir/$name.part" "$dir/$name" \
+      || { rm -f "$dir/$name.part"; return 1; }
+  fi
+  echo "$dir/$name"
+}
+
+# local_transcript VIDEO_FILE WORK_DIR OUT_TXT — on-device speech recognition, same text format as YouTube
 local_transcript() {
-  local file=$1 json=$2/yap.json out=$3 loc=${SUB_LANG:-en-US}
+  local file=$1 work=$2 out=$3 loc=${SUB_LANG:-en-US} engine events lang_line
   [[ $loc == default || $loc == auto ]] && loc=en-US
-  log "transcribing on-device ($loc)…"
-  yap transcribe "$file" --json -l "$loc" -m 120 -o "$json" >/dev/null 2>"$2/yap.err" \
-    || { warn "transcript: yap failed: $(tail -1 "$2/yap.err")"; return 1; }
-  jq '{events: [.segments[]? | {tStartMs: (.start * 1000 | floor), segs: [{utf8: .text}]}]}' "$json" \
-    | jq -r --arg title "${file##*/}" --arg url "$file" \
-        --arg lang_line "$(jq -r --arg l "$loc" '.metadata.locale // .locale // $l' "$json") (source: on-device speech recognition, yap)" \
-        "$JQ_TRANSCRIPT" >"$out"
+  engine=$(stt_engine)
+  log "transcribing on-device with $engine ($loc)…"
+  if [[ $engine == yap ]]; then
+    yap transcribe "$file" --json -l "$loc" -m 120 -o "$work/yap.json" >/dev/null 2>"$work/stt.err" \
+      || { warn "transcript: yap failed: $(tail -1 "$work/stt.err")"; return 1; }
+    events=$(jq '{events: [.segments[]? | {tStartMs: (.start * 1000 | floor), segs: [{utf8: .text}]}]}' "$work/yap.json")
+    lang_line="$(jq -r --arg l "$loc" '.metadata.locale // .locale // $l' "$work/yap.json") (source: on-device speech recognition, yap)"
+  else
+    local lang=${loc%%[-_]*} model
+    model=$(whisper_model "$lang") || { warn "transcript: whisper model download failed"; return 1; }
+    ffmpeg -nostdin -loglevel error -i "$file" -vn -ac 1 -ar 16000 -c:a pcm_s16le "$work/audio.wav" \
+      && whisper-cli -np -m "$model" -l "$lang" -t "$JOBS" -oj -of "$work/whisper" -f "$work/audio.wav" \
+           >/dev/null 2>"$work/stt.err" \
+      || { warn "transcript: whisper-cli failed: $(tail -1 "$work/stt.err")"; return 1; }
+    events=$(jq '{events: [.transcription[]? | {tStartMs: .offsets.from, segs: [{utf8: .text}]}]}' "$work/whisper.json")
+    lang_line="$lang (source: on-device speech recognition, whisper.cpp ${model##*/})"
+  fi
+  jq -r --arg title "${file##*/}" --arg url "$file" --arg lang_line "$lang_line" "$JQ_TRANSCRIPT" <<<"$events" >"$out"
   log "transcript: $(grep -c '^\[' "$out") lines → $out"
 }
 
@@ -361,7 +410,7 @@ while IFS=$'\t' read -r -u 3 order src title; do
   if ((DO_SLIDES)) && slides "$vt" "$DIR/$name.pdf" "$file"; then
     pdfs+=("$DIR/$name.pdf")
   fi
-  [[ -n ${VID2SLIDES_KEEP:-} ]] || rm -rf "$vt"
+  [[ -n ${MINVID2SLIDES_KEEP:-} ]] || rm -rf "$vt"
 done 3<"$tmp/entries.tsv"
 
 if ((${#pdfs[@]} == 1)); then cp "${pdfs[0]}" "$DIR/$OUT"
