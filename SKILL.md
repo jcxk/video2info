@@ -1,13 +1,13 @@
 ---
-name: yt-slides
+name: videoToSlides
 description: Extract presentation slides (searchable PDF) and the transcript from a YouTube video or playlist.
 ---
-# yt-slides
+# videoToSlides
 
 Use this when the user wants the slides or the transcript of a YouTube talk, lecture or playlist.
 
-1. Make sure it's installed: `yt-slides --check` (if not: `curl -fsSL https://raw.githubusercontent.com/jcxk/yt-slides/main/install.sh | bash`).
-2. Run `yt-slides "<url>"`. Useful options:
+1. Make sure it's installed: `videoToSlides --check` (if not: `curl -fsSL https://raw.githubusercontent.com/jcxk/videoToSlides/main/install.sh | bash`).
+2. Run `videoToSlides "<url>"`. Useful options:
    - `--ocr-lang spa` (or `eng+spa`) for non-English slides
    - `--lang <code>` for a specific transcript language (default: the video's own language)
    - `--crop right=25%` to cut off a fixed webcam corner
