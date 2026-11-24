@@ -49,6 +49,24 @@ brew install yt-dlp jq ffmpeg tesseract poppler yap                            #
 sudo apt install -y yt-dlp jq ffmpeg tesseract-ocr poppler-utils whisper.cpp   # Ubuntu / Debian
 ```
 
+> [!NOTE]
+> **video2info is a small script (~30 KB) that drives other tools, and you install those yourself.**
+>
+> | Tool | Used for |
+> |---|---|
+> | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | list playlists, stream videos, fetch captions |
+> | [FFmpeg](https://ffmpeg.org) | decode frames, detect slide changes (SSIM) |
+> | [Tesseract](https://github.com/tesseract-ocr/tesseract) | read the slide text (OCR) |
+> | [Poppler](https://poppler.freedesktop.org) (`pdfunite`) | join the PDF pages (`--format pdf` only) |
+> | [jq](https://jqlang.org) | captions, Markdown and text output |
+> | [yap](https://github.com/finnvoor/yap) (macOS) or [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | transcripts of local files (optional) |
+>
+> **Approximate disk space** (measured: Homebrew package sizes on macOS 27, and the packages apt added on Ubuntu 26.10):
+> - **macOS:** ~270 MB for the tools and their Homebrew dependencies, plus `yap` 7 MB. All OCR languages (`tesseract-lang`) add ~650 MB.
+> - **Ubuntu 26.10 (server):** ~540 MB for the apt packages above, including whisper.cpp. A desktop install needs less, because many libraries are already there.
+> - **whisper.cpp model:** ~150 MB per model (English, or multilingual), downloaded on first use.
+> - **Output:** each note's slide images take ~100 KB per slide.
+
 ## 📝 What the notes look like
 
 A real section from the [CppCon talk](https://www.youtube.com/watch?v=j6UwvOD0n-A) (shortened, OCR text as recognised):
