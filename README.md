@@ -22,8 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/jcxk/videoToSlides/main/install.sh 
 Installs to `~/.local/bin` (change with `PREFIX=…`) and lists any missing tools with the command to install them.
 Needs `yt-dlp jq ffmpeg tesseract poppler`, plus `yap` for local transcripts. Check any time with `videoToSlides --check`.
 
-> **macOS only for local transcripts:** they use [`yap`](https://github.com/finnvoor/yap) (`brew install yap`, macOS 26+).
+> ⚠️ **macOS only for local transcripts:** they use [`yap`](https://github.com/finnvoor/yap) (`brew install yap`, macOS 26+).
 > Elsewhere, add `--no-transcript`. Tested on macOS only.
+
+## Pending
+
+- ⚠️ Local video transcripts on Linux and Windows (WSL): a cross-platform speech-to-text engine in place of `yap`, e.g. [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
 
 ## Usage
 
