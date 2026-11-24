@@ -2,6 +2,12 @@
 
 All notable changes to this project are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Offline test suite (`make`): CLI checks, end-to-end slide extraction from a generated video, and local transcript formatting with stubbed `yap` and `whisper-cli`.
+- GitHub Actions runs it on macOS and Ubuntu; README badges.
+
 ## [0.2.0] - 2026-11-24
 
 ### Changed

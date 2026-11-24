@@ -1,5 +1,11 @@
 # minVid2slides
 
+[![tests](https://github.com/jcxk/minVid2slides/actions/workflows/test.yml/badge.svg)](https://github.com/jcxk/minVid2slides/actions/workflows/test.yml)
+[![release](https://img.shields.io/github/v/release/jcxk/minVid2slides)](https://github.com/jcxk/minVid2slides/releases)
+[![license: MIT](https://img.shields.io/github/license/jcxk/minVid2slides)](LICENSE)
+![platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![made with bash](https://img.shields.io/badge/made%20with-bash-1f425f?logo=gnubash&logoColor=white)
+
 YouTube talks, playlists or local videos → searchable slide PDFs + timestamped transcripts. One bash script, macOS and Linux.
 
 | | |
@@ -76,6 +82,10 @@ minVid2slides ~/Movies/*.mp4 --lang es-ES --ocr-lang spa     # several files →
 | `--transcript-only` / `--no-transcript` | Only the transcript / skip it |
 
 Output: `NN_Title.pdf` and `NN_Title_transcript.txt` per video, plus `Combined_Slides.pdf` (and `Combined_Transcripts.txt` for several videos).
+
+## Development
+
+`make` runs the critical tests: offline, a few seconds, the same ones CI runs on macOS and Ubuntu.
 
 ## Credits
 
