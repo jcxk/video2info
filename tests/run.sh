@@ -2,7 +2,7 @@
 # Critical offline tests for bin/minVid2slides. No network: yap and whisper-cli are stubbed.
 # Needs: ffmpeg, tesseract, poppler (pdfinfo, pdftotext), jq.    Run: make   (or: bash tests/run.sh)
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 BIN=$PWD/bin/minVid2slides FIX=$PWD/tests/fixtures
 T=$(mktemp -d "${TMPDIR:-/tmp}/minVid2slides-test.XXXXXX"); trap 'rm -rf "$T"' EXIT
 pass=0 failed=0
