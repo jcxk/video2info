@@ -1,0 +1,5 @@
+# yt-slides output
+outputs/
+
+# OS
+.DS_Store

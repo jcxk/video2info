@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# yt-slides — turn YouTube talks/playlists into searchable slide PDFs + transcripts.
+# Pipeline: yt-dlp (+jq) → ffmpeg (frames, SSIM slide changes) → tesseract (OCR PDF) → awk dedup → pdfunite.
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: yt-slides URL [options]
+
+  -o NAME.pdf              combined PDF name (default: Combined_Slides.pdf)
+  -d DIR                   output folder (default: ./outputs/<timestamp>)
+  --lang CODE              transcript language (default: the video's own language)
+  --ocr-lang LANGS         tesseract languages, e.g. eng+spa (default: eng)
+  -j N                     parallel OCR jobs (default: CPU cores)
+  --ssim T                 slide-change threshold 0-1 (default: 0.9; higher = more slides)
+  --crop SIDES             cut edges off every frame, e.g. right=25%,bottom=10% (a fixed webcam or player bar)
+  --transcript-only        only the transcript
+  --no-transcript          skip the transcript
+  --check                  show which required tools are installed
+EOF
+}
+
+die()  { printf 'yt-slides: %s\n' "$*" >&2; exit 1; }
+log()  { printf '\033[1m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- embedded jq / awk programs
+IFS= read -r -d '' JQ_ENTRIES <<'JQ' || true
+# yt-dlp --flat-playlist -J  ->  "order<TAB>url<TAB>safe_title" per video, in playlist order.
+# Order comes from a "#N" in the title when present, else the playlist position.
+def safe: gsub("[^\\p{L}\\p{N} ]"; "") | sub(" +$"; "") | gsub(" "; "_");
+
+(if has("entries") then [.entries | to_entries[] | {i: .key, e: .value}]
+ else [{i: 0, e: (. + {url: (.webpage_url // .url)})}] end)
+| map(.e as $e
+      | ($e.title // "Video_\(.i + 1)") as $t
+      | {order: (($t | capture("#(?<n>[0-9]+)").n | tonumber) // (.i + 1)),
+         url: ($e.url // "https://www.youtube.com/watch?v=\($e.id)"),
+         title: ($t | safe)})
+| sort_by(.order)[]
+| [.order, .url, .title] | @tsv
+JQ
+
+IFS= read -r -d '' JQ_CAPTIONS <<'JQ' || true
+# info.json  ->  "track_key<TAB>source<TAB>json3_url" for the best caption track.
+# --arg lang CODE: requested language ("" / default / auto = the video's own language).
+def find($d; $t):
+  ($t | ascii_downcase) as $tl | ($tl | split("-")[0]) as $b | ($d | keys_unsorted) as $ks
+  | first($ks[] | select(ascii_downcase | . == "\($tl)-orig" or . == $tl))
+    // first($ks[] | select(ascii_downcase | . == "\($b)-orig" or . == $b))
+    // first($ks[] | select(ascii_downcase | startswith("\($b)-")));
+
+(.subtitles // {}) as $s | (.automatic_captions // {}) as $a | (.language // "") as $dl
+| ($lang | ascii_downcase) as $l
+| (if $l != "" and $l != "default" and $l != "auto" then
+     (find($s; $lang) | [., "manual"])
+     // (find($a; $lang) | [., "auto"])
+     // error("no transcript for requested language '\($lang)'")
+   else
+     (if $dl != "" then find($s; $dl) | [., "manual"] else empty end)
+     // first($a | keys_unsorted[] | select(ascii_downcase | endswith("-orig")) | [., "auto-orig"])
+     // (if $dl != "" then find($a; $dl) | [., "auto"] else empty end)
+     // first($s | keys_unsorted[] | [., "manual-fallback"])
+     // first(("es", "en") as $f | find($a; $f) | [., "auto-fallback"])
+     // first($a | keys_unsorted[] | [., "auto-fallback"])
+     // error("no subtitles or automatic captions available")
+   end) as [$key, $src]
+| (if ($src | startswith("manual")) then $s else $a end)[$key] as $fmts
+| [$key, $src, (first($fmts[]? | select(.ext == "json3" and .url) | .url) // "")] | @tsv
+JQ
+
+IFS= read -r -d '' JQ_TRANSCRIPT <<'JQ' || true
+# json3 captions  ->  transcript text (header, full text, timestamped lines).
+# --arg title, url, lang_line
+def pad: tostring | if length < 2 then "0" + . else . end;
+def ts: (. / 1000 | floor) as $s | ($s / 3600 | floor) as $h | (($s % 3600) / 60 | floor) as $m
+  | if $h > 0 then "\($h | pad):\($m | pad):\($s % 60 | pad)" else "\($m | pad):\($s % 60 | pad)" end;
+
+[.events[]? | select(.segs)
+ | {t: (.tStartMs // 0), text: ([.segs[].utf8 // ""] | join("") | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; ""))}
+ | select(.text != "")]
+| reduce .[] as $e ([]; if length > 0 and .[-1].text == $e.text then . else . + [$e] end)
+| "Title: \($title)\nURL: \($url)\nLanguage: \($lang_line)\n\("=" * 80)\n\n### FULL TEXT ###\n\n"
+  + (map(.text) | join(" ")) + "\n\n### TIMESTAMPED TRANSCRIPT ###\n\n"
+  + (map("[\(.t | ts)] \(.text)") | join("\n"))
+JQ
+
+IFS= read -r -d '' AWK_TEXTDEDUP <<'AWK' || true
+# tesseract .tsv files (in slide order) -> .pdf paths to keep.   usage: awk -F'\t' -v t=0.6 -f textdedup.awk *.tsv
+# Words = confident (>= 60%) tokens of 3+ chars. Footer words on > 35% of pages are ignored when comparing.
+# Each page is compared with the previous kept page:
+#   same slide                  -> keep the page with more words
+#   previous ⊆ current          -> current replaces it (bullet builds, popups, typing animations)
+#   current ⊆ previous          -> current dropped (fade-outs, partial frames)
+# Containment needs >= 3 distinctive words, so a slide that only repeats the footer is kept.
+# A page whose words clearly match an earlier kept page (not just the previous one) is a revisit: dropped.
+# Pages with < 3 words are dropped (speaker shots, logos, blank frames).
+# Runs with LC_ALL=C: bytes >= 128 (accents) stay inside words; ASCII punctuation and “ ” « » ¿ ¡ split them.
+FNR == 1 { f[++N] = FILENAME; cnt[N] = 0; words[N] = "" }
+FNR > 1 && $11 + 0 >= 60 {
+  s = tolower($12); gsub(/(“|”|«|»|¿|¡)/, " ", s); gsub(/[[:space:][:punct:]]+/, " ", s); k = split(s, a, " ")
+  for (i = 1; i <= k; i++)
+    if (length(a[i]) >= 3 && !((N, a[i]) in has)) { has[N, a[i]] = 1; cnt[N]++; df[a[i]]++; words[N] = words[N] " " a[i] }
+}
+# revisit(p, c): both pages have >= 3 distinctive words and share >= 80% of them
+function revisit(p, c,   a, k, j, dp, dc, ip) {
+  dp = dc = ip = 0
+  k = split(words[p], a, " "); for (j = 1; j <= k; j++) if (df[a[j]] <= maxdf) { dp++; if ((c, a[j]) in has) ip++ }
+  k = split(words[c], a, " "); for (j = 1; j <= k; j++) if (df[a[j]] <= maxdf) dc++
+  return dp >= 3 && dc >= 3 && ip / (dp + dc - ip) >= 0.8
+}
+function rel(p, c,   a, k, j, dp, dc, ip, ai) {
+  dp = dc = ip = ai = 0
+  k = split(words[p], a, " ")
+  for (j = 1; j <= k; j++) { if ((c, a[j]) in has) ai++; if (df[a[j]] <= maxdf) { dp++; if ((c, a[j]) in has) ip++ } }
+  k = split(words[c], a, " ")
+  for (j = 1; j <= k; j++) if (df[a[j]] <= maxdf) dc++
+  if (dp >= 2 && dc >= 2) {
+    if (ip / (dp + dc - ip) >= t) return cnt[c] >= cnt[p] ? "replace" : "drop"   # same slide: keep the fuller
+    if (dp >= 3 && ip / dp >= 0.8) return "replace"
+    if (dc >= 3 && ip / dc >= 0.8) return "drop"
+    return ""
+  }
+  # few distinctive words: near-identical pages, or a tiny page (<= 4 words) inside its neighbour
+  if (ai / (cnt[p] + cnt[c] - ai) >= 0.9) return cnt[c] >= cnt[p] ? "replace" : "drop"
+  if (cnt[p] <= 4 && ai / cnt[p] >= 0.8) return "replace"
+  return (cnt[c] <= 4 && ai / cnt[c] >= 0.8) ? "drop" : ""
+}
+END {
+  for (i = 1; i <= N; i++) if (cnt[i] >= 3) T++          # footer words: on > 35% of the pages with text
+  maxdf = T > 4 ? int(T * 0.35) : T; if (maxdf < 2) maxdf = 2
+  for (i = 1; i <= N; i++) {
+    if (cnt[i] < 3) continue
+    r = kept ? rel(out[kept], i) : ""
+    if (r == "") for (j = 1; j < kept; j++) if (revisit(out[j], i)) { r = "drop"; break }
+    if (r == "replace") out[kept] = i; else if (r == "") out[++kept] = i
+  }
+  for (i = 1; i <= kept; i++) { p = f[out[i]]; sub(/\.tsv$/, ".pdf", p); print p }
+}
+AWK
+
+# install_hint TOOL... — one ready-to-run command for this machine's package manager
+install_hint() {
+  local pm cmd t p pkgs=""
+  if   command -v brew    >/dev/null; then pm=brew;   cmd="brew install"
+  elif command -v apt-get >/dev/null; then pm=apt;    cmd="sudo apt install -y"
+  elif command -v dnf     >/dev/null; then pm=dnf;    cmd="sudo dnf install -y"
+  elif command -v pacman  >/dev/null; then pm=pacman; cmd="sudo pacman -S --needed"
+  else printf 'install these with your package manager: %s\n' "$*"; return; fi
+  for t; do
+    case $pm:$t in
+      brew:pdfunite|pacman:pdfunite) p=poppler ;;
+      apt:pdfunite|dnf:pdfunite)     p=poppler-utils ;;
+      apt:tesseract)                 p=tesseract-ocr ;;
+      *)                             p=$t ;;
+    esac
+    pkgs="$pkgs $p"
+  done
+  printf '%s%s\n' "$cmd" "$pkgs"
+}
+
+# yt-slides --check: show which tools are installed, and how to install the missing ones
+check() {
+  local t missing=()
+  for t in yt-dlp jq ffmpeg tesseract pdfunite curl; do
+    if command -v "$t" >/dev/null; then printf '  \033[32m✓\033[0m %s\n' "$t"
+    else printf '  \033[31m✗\033[0m %s\n' "$t"; missing+=("$t"); fi
+  done
+  command -v tesseract >/dev/null && printf 'OCR languages: %s installed (more: tesseract --list-langs)\n' \
+    "$(tesseract --list-langs 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+  ((${#missing[@]} == 0)) && return 0
+  printf '\n\033[31mmissing:\033[0m %s\ninstall with:\n  %s\n' "${missing[*]}" "$(install_hint "${missing[@]}")"
+  return 1
+}
+
+# ---------------------------------------------------------------- arguments
+URL="" OUT=Combined_Slides.pdf DIR="" CROP="" SUB_LANG="" OCR_LANG=eng SSIM=0.9 TEXT_SIM=0.6
+JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+DO_TRANSCRIPT=1 DO_SLIDES=1 CHECK=0
+while (($#)); do
+  case $1 in
+    -o|--output)       OUT=${2:?}; shift ;;
+    -d|--output-dir)   DIR=${2:?}; shift ;;
+    --crop)            CROP=${2:?}; shift ;;
+    -l|--lang)         SUB_LANG=${2:?}; shift ;;
+    --ocr-lang)        OCR_LANG=${2:?}; shift ;;
+    -j|--jobs)         JOBS=${2:?}; shift ;;
+    --ssim)            SSIM=${2:?}; shift ;;
+    --transcript-only) DO_SLIDES=0 ;;
+    --no-transcript)   DO_TRANSCRIPT=0 ;;
+    -h|--help)         usage; exit 0 ;;
+    --check)           CHECK=1 ;;
+    -*)                usage >&2; die "unknown option: $1" ;;
+    *)                 [[ -z $URL ]] || die "only one URL allowed"; URL=$1 ;;
+  esac
+  shift
+done
+
+# --crop right=25%,bottom=10%  ->  ffmpeg crop filter (percent of width/height)
+CROPF=""
+if [[ -n $CROP ]]; then
+  l=0 r=0 t=0 b=0
+  for kv in ${CROP//,/ }; do
+    v=${kv#*=}; v=${v%\%}
+    [[ $kv == *=* && $v =~ ^[0-9]+$ ]] || die "--crop: expected side=N%, got '$kv'"
+    case ${kv%%=*} in left) l=$v ;; right) r=$v ;; top) t=$v ;; bottom) b=$v ;; *) die "--crop: unknown side '${kv%%=*}'" ;; esac
+  done
+  ((l + r < 90 && t + b < 90)) || die "--crop: that leaves almost nothing"
+  CROPF="crop=iw*$((100 - l - r))/100:ih*$((100 - t - b))/100:iw*$l/100:ih*$t/100,"
+fi
+((DO_SLIDES || DO_TRANSCRIPT)) || die "--transcript-only and --no-transcript leave nothing to do"
+
+if ((CHECK)); then check; exit $?; fi
+[[ -n $URL ]] || { usage >&2; exit 1; }
+
+need=(yt-dlp jq curl)
+((DO_SLIDES)) && need+=(ffmpeg tesseract pdfunite)
+missing=() ; for t in "${need[@]}"; do command -v "$t" >/dev/null || missing+=("$t"); done
+((${#missing[@]} == 0)) || die "missing: ${missing[*]}
+install with:  $(install_hint "${missing[@]}")
+(run 'yt-slides --check' for the full list)"
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/yt-slides.XXXXXX")
+trap '[[ -n ${YT_SLIDES_KEEP:-} ]] && echo "kept temp: $tmp" >&2 || rm -rf "$tmp"' EXIT
+DIR=${DIR:-outputs/$(date +%Y-%m-%d_%H-%M-%S)}
+mkdir -p "$DIR"
+
+# ---------------------------------------------------------------- steps
+# transcript INFO_JSON OUT_TXT
+transcript() {
+  local info=$1 out=$2 sel key src url sub=${1%/*}/sub.json3
+  sel=$(jq -r --arg lang "$SUB_LANG" "$JQ_CAPTIONS" "$info" 2>&1) \
+    || { warn "transcript: ${sel#jq: error*: }"; return 1; }
+  IFS=$'\t' read -r key src url <<<"$sel"
+  if ! { [[ -n $url ]] && curl -fsSL -A 'Mozilla/5.0' -o "$sub" "$url"; }; then
+    yt-dlp -q --no-warnings --load-info-json "$info" --skip-download --write-subs --write-auto-subs \
+      --sub-langs "$key" --sub-format json3 -o "${sub%.json3}" || return 1
+    mv "${sub%.json3}".*json3 "$sub" 2>/dev/null || { warn "transcript: download failed ($key)"; return 1; }
+  fi
+  jq -r --arg title "$(jq -r .title "$info")" --arg url "$(jq -r '.webpage_url // ""' "$info")" \
+    --arg lang_line "$key (source: $src, video default: $(jq -r '.language // "unknown"' "$info"))" \
+    "$JQ_TRANSCRIPT" "$sub" >"$out"
+  log "transcript: $(grep -c '^\[' "$out") lines ($key, $src) → $out"
+}
+
+# slides INFO_JSON OUT_PDF — prints nothing, writes OUT_PDF if any slide survives
+slides() {
+  local info=$1 out=$2 work=${1%/*} frames=${1%/*}/frames keep=${1%/*}/keep
+  mkdir -p "$frames" "$keep"
+
+  # 1. stream ≤720p straight into ffmpeg: 1 frame / 2 s, max 1280 px wide
+  yt-dlp -q --no-warnings --load-info-json "$info" -o - \
+      -f 'bv[height<=720][vcodec^=avc1]/bv[height<=720]/b[height<=720]/b' \
+    | ffmpeg -nostdin -loglevel error -i pipe:0 -vf "fps=0.5,${CROPF}scale='min(1280,iw)':-2" \
+        -q:v 2 "$frames/%05d.jpg" || { warn "download/frame extraction failed"; return 1; }
+  local n; n=$(find "$frames" -name '*.jpg' | wc -l | tr -d ' ')
+  ((n > 0)) || { warn "no frames extracted"; return 1; }
+
+  # 2. slide changes: SSIM of each frame vs the next (bottom 12% ignored: progress bars, captions).
+  #    Keep the LAST frame of every stable run: complete bullet builds, no mid-transition frames.
+  ffmpeg -nostdin -loglevel error -i "$frames/%05d.jpg" -start_number 2 -i "$frames/%05d.jpg" -lavfi \
+      "[0]crop=iw:ih*0.88:0:0,scale=480:-2,format=gray[a];[1]crop=iw:ih*0.88:0:0,scale=480:-2,format=gray[b];[a][b]ssim=stats_file=$work/ssim.log" \
+      -f null - || true
+  { LC_ALL=C awk -v t="$SSIM" '{sub("n:", "", $1); sub("Y:", "", $2)} $2 < t {print $1}' "$work/ssim.log" 2>/dev/null; echo "$n"; } \
+    | while read -r i; do f=$(printf %05d.jpg "$i"); ln "$frames/$f" "$keep/$f"; done
+  log "$n frames → $(find "$keep" -name '*.jpg' | wc -l | tr -d ' ') slide candidates"
+
+  # 3. OCR in parallel: one tesseract run → searchable PDF + text per slide
+  find "$keep" -name '*.jpg' -print0 \
+    | OMP_THREAD_LIMIT=1 xargs -0 -P "$JOBS" -I{} sh -c \
+        'tesseract "$1" "${1%.jpg}" -l "$2" --psm 3 pdf tsv >/dev/null 2>&1' _ {} "$OCR_LANG"
+
+  # 4. drop text-less frames, merge neighbours with the same words (keep the fuller one), drop revisits
+  local pages=() p
+  while read -r p; do pages+=("$p"); done < <(LC_ALL=C awk -F'\t' -v t="$TEXT_SIM" "$AWK_TEXTDEDUP" "$keep"/*.tsv)
+  ((${#pages[@]} > 0)) || { warn "no slides with text found"; return 1; }
+
+  # 5. merge
+  if ((${#pages[@]} == 1)); then cp "${pages[0]}" "$out"; else pdfunite "${pages[@]}" "$out" || return 1; fi
+  log "slides: ${#pages[@]} pages → $out"
+}
+
+# ---------------------------------------------------------------- main
+log "probing $URL"
+yt-dlp -q --no-warnings --flat-playlist -J "$URL" >"$tmp/probe.json"
+single=$(jq 'has("entries") | not' "$tmp/probe.json")
+
+pdfs=() transcripts=()
+while IFS=$'\t' read -r -u 3 order url title; do
+  name=$(printf '%02d_%s' "$order" "$title")
+  vt=$tmp/$order && mkdir -p "$vt"
+  log "[$order] $title"
+  if [[ $single == true ]]; then cp "$tmp/probe.json" "$vt/info.json"
+  else yt-dlp -q --no-warnings -J --skip-download "$url" >"$vt/info.json" || { warn "metadata failed: $url"; continue; }
+  fi
+  if ((DO_TRANSCRIPT)) && transcript "$vt/info.json" "$DIR/${name}_transcript.txt"; then
+    transcripts+=("$DIR/${name}_transcript.txt")
+  fi
+  if ((DO_SLIDES)) && slides "$vt/info.json" "$DIR/$name.pdf"; then
+    pdfs+=("$DIR/$name.pdf")
+  fi
+  [[ -n ${YT_SLIDES_KEEP:-} ]] || rm -rf "$vt"
+done 3< <(jq -r "$JQ_ENTRIES" "$tmp/probe.json")
+
+if ((${#pdfs[@]} == 1)); then cp "${pdfs[0]}" "$DIR/$OUT"
+elif ((${#pdfs[@]} > 1)); then pdfunite "${pdfs[@]}" "$DIR/$OUT"
+fi
+if ((${#pdfs[@]})); then log "combined: $DIR/$OUT"; fi
+
+if ((${#transcripts[@]} > 1)); then
+  for t in "${transcripts[@]}"; do cat "$t"; printf '\n\n%s\n\n' "$(printf '#%.0s' {1..80})"; done \
+    >"$DIR/Combined_Transcripts.txt"
+  log "combined transcripts: $DIR/Combined_Transcripts.txt"
+fi
+log "done → $DIR/"
