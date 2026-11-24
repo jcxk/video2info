@@ -14,6 +14,19 @@ flowchart LR
     W --> P[pdfunite<br/>per video + combined]
 ```
 
+## Performance
+
+No Python runtime and no ML framework. The work is done by long-proven CLI tools (`ffmpeg`, `tesseract`, `yt-dlp`, `poppler`), and bash only connects them. Local transcripts use the speech recognition built into macOS.
+YouTube videos are streamed at ≤720p straight into `ffmpeg` and never saved to disk, and OCR runs on all CPU cores.
+
+| Video | Length | Result | Time |
+|---|---|---|---|
+| [CppCon lightning talk](https://www.youtube.com/watch?v=j6UwvOD0n-A) (YouTube) | 2:43 | 11 slides, 46-line transcript | 3.9 s |
+| [Clustering explained](https://www.youtube.com/watch?v=A5sfobIi4Ag) (YouTube, Spanish OCR) | 13:27 | 16 slides, 372-line transcript | 6.4 s |
+| Local video (`.mp4`, on-device transcript) | 3:09 | 6 slides, 46-line transcript | 4.9 s |
+
+Measured end to end (average of 2 runs; YouTube times include streaming the video) on an Apple M6 (12 cores, 24 GB), macOS 27. Times depend on your network and CPU.
+
 ## Install
 
 ```bash
